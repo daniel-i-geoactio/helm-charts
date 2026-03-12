@@ -279,13 +279,21 @@ else
   # WP_INIT is false - check if WordPress is already installed
   # Use cached TABLE_PREFIX (set at script start)
 
-  # Check if wp_options table exists
-  if ! wp db query "SHOW TABLES LIKE '${TABLE_PREFIX}options';" --skip-column-names 2>/dev/null | grep -q "${TABLE_PREFIX}options"; then
+  echo "Verifying database tables exist (Prefix: ${TABLE_PREFIX})..."
+  
+  # Capture BOTH standard output and standard error, and bypass active plugins/themes
+  TABLE_CHECK_OUTPUT=$(wp db query "SHOW TABLES LIKE '${TABLE_PREFIX}options';" --skip-column-names --skip-plugins --skip-themes 2>&1)
+
+  # Check if wp_options table exists in the output
+  if ! echo "$TABLE_CHECK_OUTPUT" | grep -q "${TABLE_PREFIX}options"; then
     echo "========================================="
-    echo "ERROR: WordPress database tables not found!"
+    echo "ERROR: WordPress database tables not found (or WP-CLI crashed)!"
+    echo "========================================="
+    echo "WP-CLI ACTUAL ERROR OUTPUT:"
+    echo "$TABLE_CHECK_OUTPUT"
     echo "========================================="
     echo ""
-    echo "The database exists but WordPress tables are missing."
+    echo "The database exists but WordPress tables are missing or inaccessible."
     echo "This indicates one of the following issues:"
     echo ""
     echo "1. WordPress initialization has not been performed yet"
@@ -301,7 +309,6 @@ else
     echo "========================================="
     exit 1
   fi
-
 
   echo "WordPress tables found, continuing with configuration..."
 fi
