@@ -92,34 +92,57 @@ claim_bootstrap_lock() {
   while [ $retry_count -lt $max_retries ]; do
     current_time=$(date +%s)
 
-    # Ensure helm_locks table exists on every attempt
-    # (CREATE TABLE IF NOT EXISTS is idempotent and fast when table already exists)
-    # This handles the case where MariaDB accepts connections but isn't fully ready for DDL yet
-    wp db query "
-      CREATE TABLE IF NOT EXISTS ${TABLE_PREFIX}helm_locks (
-        lock_name VARCHAR(64) PRIMARY KEY,
-        lock_value VARCHAR(255) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    " >/dev/null 2>&1
+    # Use raw PHP to create the table and attempt to claim the lock atomically
+    # This bypasses WP-CLI completely, preventing the 'wp-config.php not found' error
+    LOCK_TBL="${TABLE_PREFIX}helm_locks" \
+    POD_HOST="${pod_hostname}" \
+    CUR_TIME="${current_time}" \
+    STALE="${STALE_THRESHOLD}" \
+    php -r '
+      $m = @new mysqli(getenv("WORDPRESS_DB_HOST"), getenv("WORDPRESS_DB_USER"), getenv("WORDPRESS_DB_PASSWORD"), getenv("WORDPRESS_DB_NAME"));
+      if(!$m->connect_error) {
+        $tbl = getenv("LOCK_TBL");
+        $host = $m->real_escape_string(getenv("POD_HOST"));
+        $time = (int)getenv("CUR_TIME");
+        $stale = (int)getenv("STALE");
 
-    # Atomic lock claim: override if same hostname OR no heartbeat for STALE_THRESHOLD seconds
-    wp db query "
-      INSERT INTO ${TABLE_PREFIX}helm_locks (lock_name, lock_value)
-      VALUES ('bootstrap', '$pod_hostname-$current_time')
-      ON DUPLICATE KEY UPDATE
-        lock_value = IF(
-          lock_value LIKE '$pod_hostname-%'
-          OR CAST(SUBSTRING_INDEX(lock_value, '-', -1) AS UNSIGNED) < $current_time - $STALE_THRESHOLD,
-          '$pod_hostname-$current_time',
-          lock_value
-        );
-    " >/dev/null 2>&1
+        // 1. Ensure helm_locks table exists
+        $m->query("CREATE TABLE IF NOT EXISTS {$tbl} (
+          lock_name VARCHAR(64) PRIMARY KEY,
+          lock_value VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        // 2. Atomic lock claim: override if same hostname OR lock is stale
+        $val = "{$host}-{$time}";
+        $m->query("INSERT INTO {$tbl} (lock_name, lock_value) VALUES (\"bootstrap\", \"{$val}\")
+          ON DUPLICATE KEY UPDATE
+            lock_value = IF(
+              lock_value LIKE \"{$host}-%\" OR CAST(SUBSTRING_INDEX(lock_value, \"-\", -1) AS UNSIGNED) < {$time} - {$stale},
+              \"{$val}\",
+              lock_value
+            )");
+        $m->close();
+      }
+    ' 2>/dev/null || true
 
     sleep 0.1
 
-    # Check if we got the lock
-    local lock_owner=$(wp db query "SELECT lock_value FROM ${TABLE_PREFIX}helm_locks WHERE lock_name='bootstrap';" --skip-column-names 2>/dev/null || echo "")
+    # Read back the lock owner using raw PHP
+    local lock_owner=$(
+      LOCK_TBL="${TABLE_PREFIX}helm_locks" \
+      php -r '
+        $m = @new mysqli(getenv("WORDPRESS_DB_HOST"), getenv("WORDPRESS_DB_USER"), getenv("WORDPRESS_DB_PASSWORD"), getenv("WORDPRESS_DB_NAME"));
+        if(!$m->connect_error) {
+          $tbl = getenv("LOCK_TBL");
+          $res = $m->query("SELECT lock_value FROM {$tbl} WHERE lock_name=\"bootstrap\"");
+          if($res && $row = $res->fetch_assoc()) {
+            echo $row["lock_value"];
+          }
+          $m->close();
+        }
+      ' 2>/dev/null || echo ""
+    )
 
     if [[ "$lock_owner" == "$pod_hostname-$current_time" ]]; then
       echo "Bootstrap lock acquired successfully!"
